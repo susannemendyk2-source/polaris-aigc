@@ -4,8 +4,21 @@ import React, { useEffect, useMemo, useState } from "react";
 
 const NL = "\n";
 const AUTO = "AI_AUTO / AI 自动逐镜设计";
-const DEEPSEEK_V4_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
-const BUILD_VERSION = "V4.2 RUNTIME PATCH ACTIVE · DeepSeek V4 Models Only / 运行补丁已生效 · 仅启用 DeepSeek V4 模型";
+const BUILD_VERSION = "DeepSeek V4 Models Active / 当前已启用 DeepSeek V4 模型接口";
+const PATCH_VERSION = "V4.3 DEBUG+PRODUCTION PATCH / 调试与工业增强版";
+const DEEPSEEK_DIRECT_ENDPOINT = "https://api.deepseek.com/v1/chat/completions";
+const API_MODES = ["direct / 浏览器直连", "proxy / 后端代理"];
+const GENERATION_STAGES = [
+  { id: "idle", zh: "待机", en: "Idle" },
+  { id: "analyze", zh: "分析剧本", en: "Analyze Script" },
+  { id: "compose", zh: "构建 12 模块参数", en: "Compose 12 Modules" },
+  { id: "request", zh: "请求 DeepSeek V4", en: "Request DeepSeek V4" },
+  { id: "parse", zh: "解析 JSON", en: "Parse JSON" },
+  { id: "repair", zh: "自动修复与补全", en: "Auto Repair" },
+  { id: "score", zh: "质量评分", en: "Quality Score" },
+  { id: "complete", zh: "完成", en: "Complete" },
+  { id: "error", zh: "错误", en: "Error" },
+];
 
 const DIRECTOR_STYLES = [
   { id: "standard", name: "Standard Modern Commercial / 现代商业通用", desc: "Clean, high-end commercial look. 现代商业质感、构图平衡、标准电影逻辑。", tags: "cinematic, high-end commercial, professional lighting, premium texture, 8k" },
@@ -19,11 +32,11 @@ const DIRECTOR_STYLES = [
   { id: "kubrick", name: "Stanley Kubrick / 斯坦利·库布里克", desc: "One-point perspective, sterile tension. 单点透视、冷峻秩序、压迫式空间。", tags: "Stanley Kubrick inspired, one-point perspective, geometric composition, eerie symmetry" },
   { id: "scorsese", name: "Martin Scorsese / 马丁·斯科塞斯", desc: "Urban kinetic camera, guilt, violence, voice. 都市疾速镜头、罪感、旁白与爆发力。", tags: "Martin Scorsese inspired, kinetic tracking, urban grit, moral chaos, energetic editing" },
   { id: "cameron", name: "James Cameron / 詹姆斯·卡梅隆", desc: "Spectacle, clarity, technology and emotion. 奇观清晰、技术驱动、情绪直给。", tags: "James Cameron inspired, technically precise spectacle, clean action geography, emotional clarity" },
-  { id: "spielberg", name: "Steven Spielberg / 史蒂文·斯皮尔伯格", desc: "Wonder, human warmth, motivated camera. 奇观感、温暖人性、动机明确的镜头。", tags: "Steven Spielberg inspired, wonder, warm backlight, motivated camera, emotional blocking" },
+  { id: "spielberg", name: "Steven Spielberg / 斯蒂文·斯皮尔伯格", desc: "Wonder, human warmth, motivated camera. 奇观感、温暖人性、动机明确的镜头。", tags: "Steven Spielberg inspired, wonder, warm backlight, motivated camera, emotional blocking" },
 ];
 
 const OPT = {
-  models: DEEPSEEK_V4_MODELS,
+  models: ["deepseek-v4-flash", "deepseek-v4-pro"],
   thinkingModes: ["enabled", "disabled"],
   reasoningEfforts: ["high", "max"],
   platforms: ["Runway Gen-3 / Runway 第三代", "Kling AI / 可灵", "Dreamina / 即梦", "Pika Art / Pika", "Luma Dream Machine / Luma", "Sora / Sora", "Veo / Google Veo"],
@@ -225,6 +238,98 @@ function makeWord(shots, project, script, style, tech, modules) {
   URL.revokeObjectURL(url);
 }
 
+
+function apiModeValue(mode) {
+  return String(mode || "direct").split(" /")[0];
+}
+
+function currentStageMeta(stage) {
+  return GENERATION_STAGES.find(s => s.id === stage) || GENERATION_STAGES[0];
+}
+
+function makeRequestBody({ selectedModel, systemPrompt, userPrompt, thinkingMode, reasoningEffort }) {
+  const apiThinkingMode = String(thinkingMode || "enabled").split(" /")[0];
+  const body = {
+    model: selectedModel,
+    messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+    thinking: { type: apiThinkingMode },
+    temperature: apiThinkingMode === "enabled" ? 0.55 : 0.85,
+    response_format: { type: "json_object" }
+  };
+  if (apiThinkingMode === "enabled") body.reasoning_effort = reasoningEffort;
+  return { requestBody: body, apiThinkingMode };
+}
+
+function sanitizeRequestBody(body) {
+  return {
+    ...body,
+    messages: (body.messages || []).map(m => ({ role: m.role, contentPreview: String(m.content || "").slice(0, 420), contentLength: String(m.content || "").length }))
+  };
+}
+
+function parseJsonWithRepair(text) {
+  const raw = cleanJsonText(text);
+  try {
+    return { data: JSON.parse(raw), repaired: false, raw, fixed: raw, error: null };
+  } catch (firstError) {
+    let fixed = raw
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'")
+      .replace(/,\s*([}\]])/g, "$1")
+      .replace(/\u0000/g, "");
+    const firstBrace = fixed.indexOf("{");
+    const lastBrace = fixed.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) fixed = fixed.slice(firstBrace, lastBrace + 1);
+    try {
+      return { data: JSON.parse(fixed), repaired: true, raw, fixed, error: firstError.message };
+    } catch (secondError) {
+      throw new Error(`JSON Parse Error: ${firstError.message}; repair failed: ${secondError.message}`);
+    }
+  }
+}
+
+function computeShotQuality(shot, index, allShots = []) {
+  const tips = [];
+  const metrics = {
+    visual: Math.min(100, 45 + Math.round(String(shot.sceneZh || "").length / 3) + Math.round(String(shot.sceneEn || "").length / 5)),
+    continuity: String(shot.continuityCheckZh || shot.continuityCheckEn || "").length > 20 ? 88 : 62,
+    variation: 86,
+    dialogue: String((shot.dialogueZh || "") + (shot.dialogueEn || "")).length > 12 ? 84 : 68,
+    avLogic: String((shot.avLogicZh || "") + (shot.avLogicEn || "")).length > 40 ? 90 : 64,
+    platform: String((shot.platformPromptZh || "") + (shot.platformPromptEn || "")).length > 30 ? 88 : 66,
+  };
+  const prev = index > 0 ? allShots[index - 1] : null;
+  if (prev && prev.move === shot.move) { metrics.variation -= 14; tips.push("运镜与上一镜头重复，可考虑改为静态、横移或焦点转移。 / Movement repeats the previous shot; consider static, lateral tracking, or rack focus."); }
+  if (prev && prev.shotSize === shot.shotSize) { metrics.variation -= 10; tips.push("景别与上一镜头重复，建议拉开视觉节奏。 / Shot size repeats the previous shot; vary visual rhythm."); }
+  if (metrics.visual < 75) tips.push("画面描述偏短，建议加入主体动作、空间层次、材质、光线方向。 / Visual description is short; add action, spatial layers, texture, and light direction.");
+  if (metrics.avLogic < 75) tips.push("视听逻辑偏弱，建议解释镜头为什么存在。 / AV logic is weak; explain why the shot exists.");
+  if (!tips.length) tips.push("质量稳定，适合进入视频生成。 / Stable quality; ready for video generation.");
+  const values = Object.values(metrics).map(v => Math.max(0, Math.min(100, v)));
+  const total = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+  return { total, metrics, tips };
+}
+
+function attachQuality(shots) {
+  return shots.map((s, i, arr) => ({ ...s, quality: computeShotQuality(s, i, arr) }));
+}
+
+function buildDebugLog({ label, endpoint, apiMode, requestBody, status, ok, durationMs, responsePreview, error }) {
+  return {
+    id: Date.now() + Math.random(),
+    time: new Date().toLocaleTimeString(),
+    label,
+    endpoint,
+    apiMode,
+    status: status || "N/A",
+    ok: Boolean(ok),
+    durationMs,
+    request: sanitizeRequestBody(requestBody || {}),
+    responsePreview: String(responsePreview || "").slice(0, 1200),
+    error: error ? String(error).slice(0, 1200) : "",
+  };
+}
+
+
 const GlassPanel = ({ children, title, subTitle, className = "" }) => <div className={`rounded-3xl border border-white/10 bg-black/40 backdrop-blur-2xl p-6 shadow-2xl ${className}`}>{title && <div className="mb-5 border-b border-white/5 pb-3 flex justify-between items-center"><h3 className="text-[12px] font-black uppercase tracking-[0.22em] text-amber-300">{title} <span className="text-stone-500 ml-2 text-[11px]">{subTitle}</span></h3><div className="h-1 w-6 rounded-full bg-amber-400/20" /></div>}{children}</div>;
 const FormField = ({ label, zh, children }) => <div className="space-y-2"><label className="text-[11px] font-black uppercase tracking-widest text-stone-500">{label} <span className="text-[13px] opacity-80 ml-1">{zh}</span></label>{children}</div>;
 const Input = (props) => <input {...props} className={`w-full bg-black/70 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white placeholder:text-stone-700 outline-none focus:border-amber-300/50 ${props.className || ""}`} />;
@@ -365,6 +470,109 @@ const GenerationProgressSidebar = ({ progress, status, visible, onShow, onHide }
   );
 };
 
+
+const GenerationStagePanel = ({ stage }) => {
+  const activeIndex = Math.max(0, GENERATION_STAGES.findIndex(s => s.id === stage));
+  return (
+    <GlassPanel title="Generation Stages" subTitle="生成阶段显示">
+      <div className="space-y-3">
+        {GENERATION_STAGES.filter(s => !["idle", "error"].includes(s.id)).map((s, i) => {
+          const done = i < activeIndex - 1 || stage === "complete";
+          const active = s.id === stage;
+          return <div key={s.id} className={`flex items-center gap-3 rounded-2xl border px-4 py-3 ${active ? "border-amber-300/40 bg-amber-300/10" : done ? "border-emerald-300/20 bg-emerald-300/5" : "border-white/5 bg-white/[0.03]"}`}>
+            <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-black ${active ? "bg-amber-400 text-black" : done ? "bg-emerald-400 text-black" : "bg-white/5 text-stone-500"}`}>{done ? "✓" : String(i + 1).padStart(2, "0")}</div>
+            <div>
+              <div className="text-[11px] font-black uppercase tracking-[0.16em] text-white">{s.en}</div>
+              <div className="mt-0.5 text-[11px] text-stone-500">{s.zh}</div>
+            </div>
+          </div>;
+        })}
+      </div>
+    </GlassPanel>
+  );
+};
+
+const ApiDebugConsole = ({ logs, open, onToggle, onClear }) => (
+  <GlassPanel title="API Debug Console" subTitle="接口调试台">
+    <div className="flex items-center justify-between gap-3">
+      <div className="text-[11px] leading-relaxed text-stone-500">显示实际请求模型、URL、thinking、reasoning_effort、状态码、耗时和错误详情。</div>
+      <div className="flex gap-2">
+        <button type="button" onClick={onToggle} className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-[10px] font-black text-white">{open ? "Hide" : "Show"}</button>
+        <button type="button" onClick={onClear} className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-[10px] font-black text-white">Clear</button>
+      </div>
+    </div>
+    {open && <div className="mt-4 max-h-[420px] space-y-3 overflow-y-auto pr-1">
+      {!logs.length && <div className="rounded-2xl border border-white/5 bg-black/40 p-4 text-[12px] text-stone-500">暂无日志。点击 Test API 或 Smart Generate 后会显示请求信息。</div>}
+      {logs.map(log => <div key={log.id} className={`rounded-2xl border p-4 ${log.ok ? "border-emerald-400/20 bg-emerald-400/5" : "border-rose-400/20 bg-rose-400/5"}`}>
+        <div className="flex items-center justify-between gap-3"><b className="text-[11px] uppercase tracking-[0.18em] text-white">{log.label}</b><span className="text-[10px] text-stone-500">{log.time} · {log.durationMs || 0}ms</span></div>
+        <div className="mt-2 text-[11px] text-stone-400">Mode: {log.apiMode} · HTTP: {log.status} · URL: {log.endpoint}</div>
+        <pre className="mt-3 max-h-44 overflow-y-auto whitespace-pre-wrap break-words rounded-xl bg-black/50 p-3 text-[10px] leading-relaxed text-cyan-100/70">{JSON.stringify(log.request, null, 2)}</pre>
+        {(log.responsePreview || log.error) && <pre className="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap break-words rounded-xl bg-black/50 p-3 text-[10px] leading-relaxed text-stone-300">{log.error || log.responsePreview}</pre>}
+      </div>)}
+    </div>}
+  </GlassPanel>
+);
+
+const StoryboardTimeline = ({ shots, activeShot, onSelect }) => {
+  const labels = ["Opening / 建立", "Build-up / 积累", "Turning / 转折", "Climax / 高潮", "Resolution / 余韵"];
+  return (
+    <GlassPanel title="Storyboard Overview" subTitle="分镜总览时间线">
+      <div className="mb-5 grid grid-cols-5 gap-2 text-center text-[10px] font-black uppercase tracking-[0.12em] text-stone-500">
+        {labels.map(l => <div key={l} className="rounded-xl border border-white/5 bg-white/[0.03] px-2 py-2">{l}</div>)}
+      </div>
+      <div className="flex gap-3 overflow-x-auto pb-2">
+        {shots.map((s, i) => <button key={s.id || i} type="button" onClick={() => onSelect(i)} className={`min-w-[210px] rounded-2xl border p-4 text-left transition-all ${activeShot === i ? "border-amber-300 bg-amber-400 text-black" : "border-white/10 bg-white/5 text-stone-300 hover:bg-white/10"}`}>
+          <div className="text-[10px] font-black uppercase opacity-70">Shot {i + 1} · {s.duration}</div>
+          <div className="mt-1 line-clamp-2 text-[13px] font-black">{s.titleZh}</div>
+          <div className="mt-2 text-[10px] opacity-75">{s.shotSize}</div>
+          <div className="mt-1 text-[10px] opacity-75">{s.move}</div>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-black/20"><div className="h-full rounded-full bg-current opacity-60" style={{ width: `${s.quality?.total || 72}%` }} /></div>
+        </button>)}
+      </div>
+    </GlassPanel>
+  );
+};
+
+const ShotQualityPanel = ({ shot }) => {
+  if (!shot?.quality) return null;
+  const entries = Object.entries(shot.quality.metrics || {});
+  return (
+    <div className="rounded-3xl border border-emerald-400/10 bg-emerald-400/5 p-6">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <div className="text-[12px] font-black uppercase tracking-[0.25em] text-emerald-300">Prompt Quality Score / 提示词质量评分</div>
+          <div className="mt-1 text-[11px] text-stone-500">画面、连续性、镜头差异、台词、视听逻辑、平台适配</div>
+        </div>
+        <div className="text-4xl font-black text-emerald-300">{shot.quality.total}</div>
+      </div>
+      <div className="mt-5 grid grid-cols-2 md:grid-cols-3 gap-3">
+        {entries.map(([k, v]) => <div key={k} className="rounded-2xl border border-white/5 bg-black/30 p-3"><div className="text-[10px] font-black uppercase tracking-[0.16em] text-stone-500">{k}</div><div className="mt-1 text-lg font-black text-white">{Math.max(0, Math.min(100, v))}</div></div>)}
+      </div>
+      <div className="mt-4 space-y-2">{(shot.quality.tips || []).map((t, i) => <div key={i} className="rounded-xl bg-black/30 px-3 py-2 text-[11px] leading-relaxed text-stone-300">{t}</div>)}</div>
+    </div>
+  );
+};
+
+const HistoryPanel = ({ history, onRestore }) => (
+  <GlassPanel title="Generation History" subTitle="生成历史版本">
+    <div className="space-y-3 max-h-[340px] overflow-y-auto pr-1">
+      {!history.length && <div className="rounded-2xl border border-white/5 bg-white/[0.03] p-4 text-[12px] text-stone-500">暂无历史。每次成功生成都会自动保存一个版本。</div>}
+      {history.map(item => <button key={item.id} type="button" onClick={() => onRestore(item)} className="w-full rounded-2xl border border-white/5 bg-white/[0.03] p-4 text-left hover:bg-white/10">
+        <div className="text-[11px] font-black uppercase tracking-[0.16em] text-amber-300">{item.title}</div>
+        <div className="mt-1 text-[11px] text-stone-500">{item.shots.length} shots · {item.model}</div>
+      </button>)}
+    </div>
+  </GlassPanel>
+);
+
+const RuntimePatchBadge = ({ selectedModel, apiMode }) => (
+  <div className="fixed bottom-4 left-4 z-[120] rounded-2xl border border-emerald-400/20 bg-emerald-400/10 px-4 py-3 shadow-[0_0_40px_rgba(52,211,153,0.14)] backdrop-blur-xl">
+    <div className="text-[10px] font-black uppercase tracking-[0.22em] text-emerald-300">V4.3 PATCH ACTIVE / 增强功能已生效</div>
+    <div className="mt-1 text-[11px] font-bold text-white">API model = {selectedModel}</div>
+    <div className="mt-0.5 text-[11px] text-stone-400">API mode = {apiModeValue(apiMode)}</div>
+  </div>
+);
+
 export default function PolarisMasterOS() {
   const [script, setScript] = useState(DEFAULT_SCRIPT);
   const [project, setProject] = useState("追梦人之影 Shadow of Dreams");
@@ -379,18 +587,18 @@ export default function PolarisMasterOS() {
   const [selectedModel, setSelectedModel] = useState(OPT.models[0]);
   const [thinkingMode, setThinkingMode] = useState(OPT.thinkingModes[0]);
   const [reasoningEffort, setReasoningEffort] = useState(OPT.reasoningEfforts[0]);
+  const [apiMode, setApiMode] = useState(API_MODES[0]);
+  const [proxyPath, setProxyPath] = useState("/api/deepseek");
+  const [apiDebugOpen, setApiDebugOpen] = useState(true);
+  const [apiDebugLogs, setApiDebugLogs] = useState([]);
+  const [apiTestResult, setApiTestResult] = useState(null);
+  const [generationStage, setGenerationStage] = useState("idle");
+  const [generationHistory, setGenerationHistory] = useState([]);
   const [status, setStatus] = useState("System Standby / 系统就绪 · DeepSeek V4 Models Ready");
   const [negativePrompt, setNegativePrompt] = useState(DEFAULT_NEGATIVE);
   const [creativeBrief, setCreativeBrief] = useState({ genre: OPT.genres[0], pacing: OPT.pacing[0], dialogueStyle: OPT.dialogueStyles[0], mood: "孤独、怀旧、热爱电影、深夜奇迹 / lonely, nostalgic, devoted to cinema, midnight miracle" });
   const [modules, setModules] = useState(DEFAULT_MODULES);
   const [tech, setTech] = useState({ platform: OPT.platforms[0], ratio: OPT.ratios[0], shotCount: "8", shotSizeLock: AUTO, cameraLock: AUTO, lensLock: AUTO, movementLock: AUTO, stabilizerLock: AUTO, lightingLock: AUTO, compositionLock: OPT.compositions[0], editLock: OPT.edits[0], soundLock: OPT.sounds[0], colorScience: OPT.colors[2], bilingualDialogue: true, professionalAV: true, includeSound: true });
-
-  useEffect(() => {
-    if (!DEEPSEEK_V4_MODELS.includes(selectedModel)) {
-      setSelectedModel(DEEPSEEK_V4_MODELS[0]);
-      setStatus(`Model migrated to ${DEEPSEEK_V4_MODELS[0]} / 已自动切换到 DeepSeek V4 模型`);
-    }
-  }, [selectedModel]);
 
   useEffect(() => {
     if (!isGenerating) return;
@@ -401,6 +609,10 @@ export default function PolarisMasterOS() {
     return () => window.clearInterval(timer);
   }, [isGenerating]);
 
+  useEffect(() => {
+    if (!OPT.models.includes(selectedModel)) setSelectedModel(OPT.models[0]);
+  }, [selectedModel]);
+
   const moduleKeys = Object.keys(modules);
   const active = shots[activeShot] || null;
   const livePrompt = active ? buildFinalPrompt(active, project, style, tech, modules, negativePrompt) : "";
@@ -409,15 +621,64 @@ export default function PolarisMasterOS() {
   const updateActiveShot = patch => { if (!active) return; setShots(prev => prev.map((s, i) => i === activeShot ? { ...s, ...patch } : s)); };
   const rebuildFinalPrompts = arr => arr.map(s => ({ ...s, finalPrompt: buildFinalPrompt(s, project, style, tech, modules, negativePrompt) }));
 
+
+  const addDebugLog = log => setApiDebugLogs(prev => [log, ...prev].slice(0, 20));
+  const getApiEndpoint = () => apiModeValue(apiMode) === "proxy" ? (proxyPath || "/api/deepseek") : DEEPSEEK_DIRECT_ENDPOINT;
+
+  async function requestDeepSeek(requestBody, label = "Generate") {
+    const mode = apiModeValue(apiMode);
+    const endpoint = getApiEndpoint();
+    const headers = { "Content-Type": "application/json" };
+    if (mode === "direct") headers.Authorization = `Bearer ${apiKey.trim().replace(/[^\x00-\x7F]/g, "")}`;
+    const start = performance.now();
+    let responseText = "";
+    try {
+      const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(requestBody) });
+      responseText = await res.text();
+      const durationMs = Math.round(performance.now() - start);
+      addDebugLog(buildDebugLog({ label, endpoint, apiMode: mode, requestBody, status: res.status, ok: res.ok, durationMs, responsePreview: responseText }));
+      if (!res.ok) throw new Error(`API Error ${res.status}: ${responseText.slice(0, 240)}`);
+      return JSON.parse(responseText);
+    } catch (error) {
+      const durationMs = Math.round(performance.now() - start);
+      addDebugLog(buildDebugLog({ label, endpoint, apiMode: mode, requestBody, status: "ERR", ok: false, durationMs, responsePreview: responseText, error: error.message }));
+      throw error;
+    }
+  }
+
+  async function handleTestApi() {
+    if (apiModeValue(apiMode) === "direct" && !apiKey.trim()) {
+      setApiTestResult({ ok: false, text: "API Key Required / 请输入 DeepSeek API Key" });
+      return;
+    }
+    setApiTestResult({ ok: null, text: "Testing DeepSeek API... / 正在测试接口" });
+    const testPrompt = "Return ONLY this JSON: {\"pong\":true}";
+    const { requestBody } = makeRequestBody({ selectedModel, systemPrompt: "You are an API health check endpoint. Return valid JSON only.", userPrompt: testPrompt, thinkingMode, reasoningEffort });
+    try {
+      const data = await requestDeepSeek(requestBody, "API Health Test");
+      const text = data?.choices?.[0]?.message?.content || JSON.stringify(data).slice(0, 240);
+      setApiTestResult({ ok: true, text: `API Connected / 接口连接成功 · Model: ${selectedModel} · ${String(text).slice(0, 120)}` });
+      setStatus(`API Connected / DeepSeek V4 接口连接成功 · ${selectedModel}`);
+    } catch (error) {
+      setApiTestResult({ ok: false, text: `API Test Failed / 接口测试失败: ${error.message}` });
+      setStatus(`API Test Failed / 接口测试失败: ${error.message}`);
+    }
+  }
+
+  function restoreHistory(item) {
+    setShots(item.shots);
+    setActiveShot(0);
+    setStatus(`History Restored / 已恢复历史版本: ${item.title}`);
+  }
+
   async function handleGenerate() {
-    if (!apiKey.trim()) return setStatus("API Key Required / 请输入 DeepSeek API Key");
+    if (apiModeValue(apiMode) === "direct" && !apiKey.trim()) return setStatus("API Key Required / 请输入 DeepSeek API Key");
     if (!script.trim()) return setStatus("Script Required / 请输入剧本大纲");
-    const apiModel = DEEPSEEK_V4_MODELS.includes(selectedModel) ? selectedModel : DEEPSEEK_V4_MODELS[0];
-    if (apiModel !== selectedModel) setSelectedModel(apiModel);
     setIsGenerating(true);
     setProgressSidebarVisible(true);
     setGenerateProgress(6);
-    setStatus(`AI Directing V4 with ${apiModel} / 正在使用 ${apiModel} 执行 12 模块工业分镜`);
+    setGenerationStage("analyze");
+    setStatus(`AI Directing V4 with ${selectedModel} / 正在使用 ${selectedModel} 执行 12 模块工业分镜`);
 
     const lockRules = [
       tech.shotSizeLock !== AUTO ? `Locked shot size: ${tech.shotSizeLock}` : "Shot size is dynamic, choose per narrative beat.",
@@ -434,43 +695,40 @@ export default function PolarisMasterOS() {
       tech.includeSound ? "Sound design and transition fields are required for every shot." : "Sound fields may be minimal but must exist.",
     ].join(NL);
 
+    setGenerationStage("compose");
     setGenerateProgress(22);
 
     const systemPrompt = `You are Polaris Cinema OS V4, a bilingual Hollywood-grade AI video director system. Return ONLY one valid JSON object. Every creative field must be bilingual Chinese and English. Dialogue must also be bilingual. Do not use fixed defaults unless locked. Integrate all 12 modules: 1 Character Continuity, 2 Location Continuity, 3 Continuity Check, 4 Narrative Rhythm, 5 Blocking, 6 Composition, 7 Editing Language, 8 Sound Design, 9 Platform Prompt Adaptation, 10 Omni Multi-Parameter Control, 11 Production Mode, 12 Multi-Version Notes.\n\nLOCK RULES:\n${lockRules}\n\nDIRECTOR STYLE:\n${style.name}\n${style.desc}\n${style.tags}\n\nOUTPUT JSON SCHEMA:\n{"shots":[{"id":1,"titleZh":"中文镜头标题","titleEn":"English shot title","emotionalBeatZh":"中文情绪节点","emotionalBeatEn":"English emotional beat","narrativeFunctionZh":"中文叙事功能","narrativeFunctionEn":"English narrative function","sceneZh":"中文电影化画面内容","sceneEn":"English cinematic visual content","dialogueZh":"中文台词或有意义的沉默","dialogueEn":"English dialogue or meaningful silence","avLogicZh":"中文视听语言逻辑","avLogicEn":"English AV logic","blockingZh":"中文人物调度","blockingEn":"English actor blocking","compositionZh":"中文构图逻辑","compositionEn":"English composition logic","soundDesignZh":"中文声音设计","soundDesignEn":"English sound design","transitionZh":"中文剪辑/转场","transitionEn":"English editing/transition","continuityCheckZh":"中文连续性风险与修正","continuityCheckEn":"English continuity risk and fix","omniParamPromptZh":"中文全能多参，包含运动强度、主体一致性、镜头控制、时长、帧率、分辨率、种子策略、创意强度、提示词权重、负面权重、平台可调参数","omniParamPromptEn":"English omni multi-parameter controls including motion strength, subject consistency, camera control, duration, fps, resolution, seed strategy, creativity, prompt weight, negative weight and platform-specific adjustable parameters","platformPromptZh":"中文平台适配提示词","platformPromptEn":"English platform-adapted prompt","versionNotesZh":"中文多版本改写方向","versionNotesEn":"English multi-version notes","shotSize":"bilingual shot size","camera":"bilingual camera","lens":"bilingual lens","move":"bilingual movement","stabilizer":"bilingual support","light":"bilingual lighting","colorScience":"bilingual color look","compositionType":"bilingual composition type","editType":"bilingual edit type","soundMode":"bilingual sound mode","duration":"4-6s / 4-6 秒","promptZh":"中文完整视频提示词","promptEn":"English complete video prompt"}]}`;
     const userPrompt = [`Project / 项目: ${project}`, `Platform / 平台: ${tech.platform}`, `Aspect Ratio / 画幅: ${tech.ratio}`, `Shot Count / 镜头数量: ${tech.shotCount}`, `Genre / 类型: ${creativeBrief.genre}`, `Pacing / 节奏: ${creativeBrief.pacing}`, `Dialogue Style / 台词风格: ${creativeBrief.dialogueStyle}`, `Mood / 情绪: ${creativeBrief.mood}`, `Color Science / 色彩科学: ${tech.colorScience}`, `Negative Prompt / 负面提示词: ${negativePrompt}`, `12 Modules / 十二模块:\n${moduleText(modules)}`, `Script Outline / 剧本大纲: ${script}`].join(NL);
 
     try {
+      setGenerationStage("request");
       setGenerateProgress(38);
-      const apiThinkingMode = String(thinkingMode).split(" /")[0];
-      const requestBody = {
-        model: apiModel,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
-        thinking: { type: apiThinkingMode },
-        temperature: apiThinkingMode === "enabled" ? 0.55 : 0.85,
-        response_format: { type: "json_object" }
-      };
-      if (apiThinkingMode === "enabled") requestBody.reasoning_effort = reasoningEffort;
-      const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey.trim().replace(/[^\x00-\x7F]/g, "")}` },
-        body: JSON.stringify(requestBody)
-      });
-      if (!res.ok) throw new Error(`API Error ${res.status}: ${(await res.text()).slice(0, 160)}`);
+      const { requestBody } = makeRequestBody({ selectedModel, systemPrompt, userPrompt, thinkingMode, reasoningEffort });
+      const data = await requestDeepSeek(requestBody, "Generate Shooting Script");
+      setGenerationStage("parse");
       setGenerateProgress(64);
-      const data = await res.json();
-      const parsed = JSON.parse(cleanJsonText(data?.choices?.[0]?.message?.content || ""));
+      const parsedResult = parseJsonWithRepair(data?.choices?.[0]?.message?.content || "");
+      if (parsedResult.repaired) addDebugLog(buildDebugLog({ label: "JSON Auto Repair", endpoint: "local", apiMode: "local", requestBody: { model: selectedModel, repair: true }, status: "REPAIRED", ok: true, durationMs: 0, responsePreview: parsedResult.fixed }));
+      const parsed = parsedResult.data;
+      setGenerationStage("repair");
       setGenerateProgress(78);
       const normalized = Array.isArray(parsed.shots) ? parsed.shots.map(normalizeShot) : [];
       if (!normalized.length) throw new Error("JSON parsed but shots array is empty / JSON 已解析但没有镜头数组");
-      const withPrompts = rebuildFinalPrompts(normalized);
+      setGenerationStage("score");
+      const withQuality = attachQuality(normalized);
+      const withPrompts = rebuildFinalPrompts(withQuality);
       setGenerateProgress(94);
       setShots(withPrompts);
       setActiveShot(0);
       setProgressSidebarVisible(true);
+      setGenerationHistory(prev => [{ id: Date.now(), title: `${new Date().toLocaleString()} · ${selectedModel}`, model: selectedModel, shots: withPrompts }, ...prev].slice(0, 10));
       setGenerateProgress(100);
-      setStatus(`Directing Successful with ${apiModel} / 已使用 ${apiModel} 生成 ${withPrompts.length} 个 12 模块双语镜头`);
+      setGenerationStage("complete");
+      setStatus(`Directing Successful with ${selectedModel} / 已使用 ${selectedModel} 生成 ${withPrompts.length} 个 12 模块双语镜头`);
     } catch (e) {
       setGenerateProgress(0);
+      setGenerationStage("error");
       setStatus(`Error: ${e.message} / 检查 API Key、模型、网络或 JSON 输出`);
     } finally {
       window.setTimeout(() => setIsGenerating(false), 450);
@@ -478,21 +736,17 @@ export default function PolarisMasterOS() {
   }
 
   return <div className="min-h-screen bg-[#070707] text-stone-300 font-sans">
-    <div className="fixed bottom-4 left-4 z-[120] rounded-2xl border border-emerald-400/30 bg-black/90 px-4 py-3 shadow-[0_0_40px_rgba(16,185,129,0.18)] backdrop-blur-xl">
-      <div className="text-[10px] font-black uppercase tracking-[0.22em] text-emerald-300">V4.2 PATCH ACTIVE / 修改已生效</div>
-      <div className="mt-1 select-all text-xs font-black text-white">API model = {DEEPSEEK_V4_MODELS.includes(selectedModel) ? selectedModel : DEEPSEEK_V4_MODELS[0]}</div>
-      <div className="mt-1 text-[10px] text-stone-500">没有看到此标识 = 你还在运行旧文件</div>
-    </div>
+    <RuntimePatchBadge selectedModel={selectedModel} apiMode={apiMode} />
     {isGenerating && <GenerationProgressSidebar progress={generateProgress} status={status} visible={progressSidebarVisible} onShow={() => setProgressSidebarVisible(true)} onHide={() => setProgressSidebarVisible(false)} />}
     <header className="relative sticky top-0 z-50 border-b border-white/5 bg-black/75 backdrop-blur-3xl px-8 py-5 flex flex-col xl:flex-row gap-5 xl:items-center xl:justify-between">
-      <div className="flex items-center gap-5"><BrandMark active={isGenerating} progress={generateProgress} /><div><h1 className="text-lg font-black uppercase tracking-[0.22em] text-white">北极星AIGC电影工业系统 V4</h1><span className="text-[11px] font-bold text-amber-300/70 uppercase tracking-widest mt-1 block">Polaris AIGC Film Industrial System V4</span><span className="text-[11px] font-bold text-stone-500 uppercase tracking-widest mt-1 block">{status}</span><span className="mt-2 inline-flex rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-emerald-300">{BUILD_VERSION} · MODEL: {DEEPSEEK_V4_MODELS.includes(selectedModel) ? selectedModel : DEEPSEEK_V4_MODELS[0]}</span></div></div>
+      <div className="flex items-center gap-5"><BrandMark active={isGenerating} progress={generateProgress} /><div><h1 className="text-lg font-black uppercase tracking-[0.22em] text-white">北极星AIGC电影工业系统 V4</h1><span className="text-[11px] font-bold text-amber-300/70 uppercase tracking-widest mt-1 block">Polaris AIGC Film Industrial System V4</span><span className="text-[11px] font-bold text-stone-500 uppercase tracking-widest mt-1 block">{status}</span><span className="mt-2 inline-flex rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-emerald-300">{BUILD_VERSION} · MODEL: {selectedModel}</span></div></div>
       <div className="pointer-events-none absolute left-1/2 top-1/2 hidden -translate-x-1/2 -translate-y-1/2 xl:flex flex-col items-center rounded-full border border-amber-300/20 bg-black/40 px-8 py-2 shadow-[0_0_40px_rgba(251,191,36,0.10)]"><span className="text-[13px] font-black tracking-[0.28em] text-amber-200">（Haley黄衍衔）</span><span className="mt-1 text-[9px] font-black uppercase tracking-[0.35em] text-stone-500">Authentic Seal / 防伪标识</span></div>
       <div className="flex flex-wrap gap-3"><button onClick={handleGenerate} disabled={isGenerating} className="relative overflow-hidden bg-amber-400 hover:bg-amber-500 text-black px-8 py-3.5 rounded-2xl font-black text-[12px] uppercase tracking-widest disabled:opacity-80"><span className="relative z-10 flex items-center gap-2">{isGenerating && <span className="h-4 w-4 rounded-full border-2 border-black/25 border-t-black animate-spin" />}{isGenerating ? `AI Directing ${Math.round(generateProgress)}% / 生成中` : "Smart Generate / 智能生成"}</span>{isGenerating && <span className="absolute left-0 top-0 h-full bg-white/30 transition-all duration-500" style={{ width: `${generateProgress}%` }} />}</button><button onClick={() => { setShots(p => rebuildFinalPrompts(p)); setStatus("Prompts Rebuilt / 已重建提示词"); }} disabled={!shots.length} className="bg-white/5 border border-white/10 text-white px-6 py-3.5 rounded-2xl font-black text-[12px] uppercase disabled:opacity-40">Rebuild Prompt / 重建提示词</button><button onClick={() => makeWord(rebuildFinalPrompts(shots), project, script, style, tech, modules)} disabled={!shots.length} className="bg-white/5 border border-white/10 text-white px-6 py-3.5 rounded-2xl font-black text-[12px] uppercase disabled:opacity-40">Export / 导出脚本</button></div>
     </header>
 
     <main className="max-w-[1920px] mx-auto px-8 py-10 grid grid-cols-1 xl:grid-cols-12 gap-8">
       <section className="xl:col-span-3 space-y-8">
-        <GlassPanel title="AI Core" subTitle="AI 智算大脑"><div className="space-y-5"><FormField label="DeepSeek API Key" zh="智算令牌"><Input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="sk-..." /></FormField><FormField label="AI Model" zh="模型选择 / 仅 DeepSeek V4"><Select items={DEEPSEEK_V4_MODELS} value={DEEPSEEK_V4_MODELS.includes(selectedModel) ? selectedModel : DEEPSEEK_V4_MODELS[0]} onChange={setSelectedModel} /></FormField><div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-4"><div className="text-[10px] font-black uppercase tracking-[0.22em] text-emerald-300">Current API Model / 当前实际接口模型</div><div className="mt-2 select-all text-sm font-black text-white">{selectedModel}</div><div className="mt-1 text-[11px] leading-relaxed text-stone-400">请求体会真实使用 model: {DEEPSEEK_V4_MODELS.includes(selectedModel) ? selectedModel : DEEPSEEK_V4_MODELS[0]}</div></div><FormField label="Thinking Mode" zh="思考模式 / API thinking.type"><Select items={OPT.thinkingModes} value={thinkingMode} onChange={setThinkingMode} /></FormField><FormField label="Reasoning Effort" zh="推理强度 / reasoning_effort"><Select items={OPT.reasoningEfforts} value={reasoningEffort} onChange={setReasoningEffort} /></FormField><FormField label="Project" zh="项目名称"><Input value={project} onChange={e => setProject(e.target.value)} /></FormField><FormField label="Shot Count" zh="镜头数量"><Select items={OPT.shotCounts} value={tech.shotCount} onChange={v => setTech(p => ({ ...p, shotCount: v }))} /></FormField></div></GlassPanel>
+        <GlassPanel title="AI Core" subTitle="AI 智算大脑"><div className="space-y-5"><FormField label="API Mode" zh="接口模式"><Select items={API_MODES} value={apiMode} onChange={setApiMode} /></FormField>{apiModeValue(apiMode) === "proxy" && <FormField label="Proxy Path" zh="后端代理路径"><Input value={proxyPath} onChange={e => setProxyPath(e.target.value)} placeholder="/api/deepseek" /></FormField>}<FormField label="DeepSeek API Key" zh="智算令牌"><Input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={apiModeValue(apiMode) === "proxy" ? "Proxy mode can use .env.local / 代理模式可留空" : "sk-..."} /></FormField><FormField label="AI Model" zh="模型选择 / 官方 V4 模型 ID"><Select items={OPT.models} value={selectedModel} onChange={setSelectedModel} /></FormField><div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-4"><div className="text-[10px] font-black uppercase tracking-[0.22em] text-emerald-300">Current API Model / 当前实际接口模型</div><div className="mt-2 select-all text-sm font-black text-white">{selectedModel}</div><div className="mt-1 text-[11px] leading-relaxed text-stone-400">请求体会真实使用 model: {selectedModel}</div><div className="mt-1 text-[11px] leading-relaxed text-stone-400">Endpoint: {getApiEndpoint()}</div></div><FormField label="Thinking Mode" zh="思考模式 / API thinking.type"><Select items={OPT.thinkingModes} value={thinkingMode} onChange={setThinkingMode} /></FormField><FormField label="Reasoning Effort" zh="推理强度 / reasoning_effort"><Select items={OPT.reasoningEfforts} value={reasoningEffort} onChange={setReasoningEffort} /></FormField><button type="button" onClick={handleTestApi} className="w-full rounded-2xl border border-emerald-400/20 bg-emerald-400/10 px-5 py-3 text-[12px] font-black uppercase tracking-[0.18em] text-emerald-300 hover:bg-emerald-400/20">Test DeepSeek API / 测试接口</button>{apiTestResult && <div className={`rounded-2xl border p-4 text-[12px] leading-relaxed ${apiTestResult.ok ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200" : apiTestResult.ok === null ? "border-amber-400/20 bg-amber-400/10 text-amber-200" : "border-rose-400/20 bg-rose-400/10 text-rose-200"}`}>{apiTestResult.text}</div>}<FormField label="Project" zh="项目名称"><Input value={project} onChange={e => setProject(e.target.value)} /></FormField><FormField label="Shot Count" zh="镜头数量"><Select items={OPT.shotCounts} value={tech.shotCount} onChange={v => setTech(p => ({ ...p, shotCount: v }))} /></FormField></div></GlassPanel><GenerationStagePanel stage={generationStage} /><ApiDebugConsole logs={apiDebugLogs} open={apiDebugOpen} onToggle={() => setApiDebugOpen(v => !v)} onClear={() => setApiDebugLogs([])} />
         <GlassPanel title="Director Styles" subTitle="大师风格"><div className="space-y-3 max-h-[560px] overflow-y-auto pr-1">{DIRECTOR_STYLES.map(s => <button key={s.id} onClick={() => setStyle(s)} className={`w-full p-4 rounded-2xl border text-left ${style.id === s.id ? "bg-amber-400 border-amber-400 text-black" : "bg-white/5 border-white/5 hover:bg-white/10"}`}><div className="text-[12px] font-black uppercase mb-1">{s.name}</div><div className="text-[10px] leading-relaxed opacity-70">{s.desc}</div></button>)}</div></GlassPanel>
         <GlassPanel title="Output & Locks" subTitle="输出与参数锁"><div className="space-y-5"><FormField label="Platform" zh="输出平台"><Select items={OPT.platforms} value={tech.platform} onChange={v => setTech(p => ({ ...p, platform: v }))} /></FormField><FormField label="Aspect Ratio" zh="画幅比例"><Select items={OPT.ratios} value={tech.ratio} onChange={v => setTech(p => ({ ...p, ratio: v }))} /></FormField><FormField label="Shot Size Lock" zh="景别锁定"><Select items={OPT.shotSizes} value={tech.shotSizeLock} onChange={v => setTech(p => ({ ...p, shotSizeLock: v }))} /></FormField><FormField label="Camera Lock" zh="摄影机锁定"><Select items={OPT.cameras} value={tech.cameraLock} onChange={v => setTech(p => ({ ...p, cameraLock: v }))} /></FormField><FormField label="Lens Lock" zh="焦段锁定"><Select items={OPT.lensFocals} value={tech.lensLock} onChange={v => setTech(p => ({ ...p, lensLock: v }))} /></FormField><FormField label="Movement Lock" zh="运镜锁定"><Select items={OPT.moves} value={tech.movementLock} onChange={v => setTech(p => ({ ...p, movementLock: v }))} /></FormField><FormField label="Stabilizer Lock" zh="稳定系统锁定"><Select items={OPT.stabilizers} value={tech.stabilizerLock} onChange={v => setTech(p => ({ ...p, stabilizerLock: v }))} /></FormField><FormField label="Lighting Lock" zh="光影锁定"><Select items={OPT.lights} value={tech.lightingLock} onChange={v => setTech(p => ({ ...p, lightingLock: v }))} /></FormField><FormField label="Composition Lock" zh="构图锁定"><Select items={OPT.compositions} value={tech.compositionLock} onChange={v => setTech(p => ({ ...p, compositionLock: v }))} /></FormField><FormField label="Edit Lock" zh="剪辑锁定"><Select items={OPT.edits} value={tech.editLock} onChange={v => setTech(p => ({ ...p, editLock: v }))} /></FormField><FormField label="Sound Lock" zh="声音锁定"><Select items={OPT.sounds} value={tech.soundLock} onChange={v => setTech(p => ({ ...p, soundLock: v }))} /></FormField></div></GlassPanel>
       </section>
@@ -500,15 +754,18 @@ export default function PolarisMasterOS() {
       <section className="xl:col-span-6 space-y-8">
         <GlassPanel title="Script & Creative Bible" subTitle="剧本与创作圣经"><div className="space-y-5"><TextArea value={script} onChange={e => setScript(e.target.value)} className="min-h-[170px] text-lg font-bold" /><div className="grid grid-cols-1 md:grid-cols-2 gap-5"><FormField label="Genre" zh="类型"><Select items={OPT.genres} value={creativeBrief.genre} onChange={v => setCreativeBrief(p => ({ ...p, genre: v }))} /></FormField><FormField label="Pacing" zh="节奏"><Select items={OPT.pacing} value={creativeBrief.pacing} onChange={v => setCreativeBrief(p => ({ ...p, pacing: v }))} /></FormField><FormField label="Dialogue Style" zh="台词风格"><Select items={OPT.dialogueStyles} value={creativeBrief.dialogueStyle} onChange={v => setCreativeBrief(p => ({ ...p, dialogueStyle: v }))} /></FormField><FormField label="Color Science" zh="色彩科学"><Select items={OPT.colors} value={tech.colorScience} onChange={v => setTech(p => ({ ...p, colorScience: v }))} /></FormField></div><FormField label="Mood" zh="情绪关键词"><TextArea value={creativeBrief.mood} onChange={e => setCreativeBrief(p => ({ ...p, mood: e.target.value }))} /></FormField><FormField label="Negative Prompt" zh="负面提示词"><TextArea value={negativePrompt} onChange={e => setNegativePrompt(e.target.value)} /></FormField></div></GlassPanel>
 
-        {shots.length > 0 && active && <div className="space-y-6"><div className="flex gap-2 overflow-x-auto pb-4">{shots.map((_, i) => <button key={i} onClick={() => setActiveShot(i)} className={`min-w-fit px-5 py-3 rounded-2xl text-[11px] font-black uppercase ${activeShot === i ? "bg-amber-400 text-black" : "bg-white/5 text-stone-500 hover:bg-white/10"}`}>Shot {i + 1} / 镜头 {i + 1}</button>)}</div><GlassPanel title={`Shot Matrix #${active.id}`} subTitle={`${active.titleZh} / ${active.titleEn}`}><div className="space-y-7"><div className="grid grid-cols-1 md:grid-cols-2 gap-6"><FormField label="Visual ZH" zh="中文画面"><TextArea value={active.sceneZh} rows={6} onChange={e => updateActiveShot({ sceneZh: e.target.value })} /></FormField><FormField label="Visual EN" zh="英文画面"><TextArea value={active.sceneEn} rows={6} onChange={e => updateActiveShot({ sceneEn: e.target.value })} /></FormField><FormField label="Dialogue ZH" zh="中文台词"><TextArea value={active.dialogueZh} rows={3} onChange={e => updateActiveShot({ dialogueZh: e.target.value })} /></FormField><FormField label="Dialogue EN" zh="英文台词"><TextArea value={active.dialogueEn} rows={3} onChange={e => updateActiveShot({ dialogueEn: e.target.value })} /></FormField><FormField label="AV Logic ZH" zh="中文视听逻辑"><TextArea value={active.avLogicZh} rows={5} onChange={e => updateActiveShot({ avLogicZh: e.target.value })} /></FormField><FormField label="AV Logic EN" zh="英文视听逻辑"><TextArea value={active.avLogicEn} rows={5} onChange={e => updateActiveShot({ avLogicEn: e.target.value })} /></FormField><FormField label="Blocking ZH" zh="中文调度"><TextArea value={active.blockingZh} rows={4} onChange={e => updateActiveShot({ blockingZh: e.target.value })} /></FormField><FormField label="Blocking EN" zh="英文调度"><TextArea value={active.blockingEn} rows={4} onChange={e => updateActiveShot({ blockingEn: e.target.value })} /></FormField></div><div className="grid grid-cols-1 md:grid-cols-4 gap-5"><FormField label="Shot Size" zh="景别"><Select items={OPT.shotSizes} value={active.shotSize} onChange={v => updateActiveShot({ shotSize: v })} /></FormField><FormField label="Camera" zh="摄影机"><Select items={OPT.cameras} value={active.camera} onChange={v => updateActiveShot({ camera: v })} /></FormField><FormField label="Lens" zh="焦段"><Select items={OPT.lensFocals} value={active.lens} onChange={v => updateActiveShot({ lens: v })} /></FormField><FormField label="Movement" zh="运镜"><Select items={OPT.moves} value={active.move} onChange={v => updateActiveShot({ move: v })} /></FormField><FormField label="Stabilizer" zh="稳定"><Select items={OPT.stabilizers} value={active.stabilizer} onChange={v => updateActiveShot({ stabilizer: v })} /></FormField><FormField label="Lighting" zh="光影"><Select items={OPT.lights} value={active.light} onChange={v => updateActiveShot({ light: v })} /></FormField><FormField label="Composition" zh="构图"><Select items={OPT.compositions} value={active.compositionType} onChange={v => updateActiveShot({ compositionType: v })} /></FormField><FormField label="Edit" zh="剪辑"><Select items={OPT.edits} value={active.editType} onChange={v => updateActiveShot({ editType: v })} /></FormField></div><div className="grid grid-cols-1 md:grid-cols-2 gap-6"><FormField label="Omni Multi-Parameter" zh="全能多参"><TextArea value={`${active.omniParamPromptZh}${NL}${active.omniParamPromptEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ omniParamPromptZh: zh, omniParamPromptEn: en.join(NL) }); }} /></FormField><FormField label="Platform Params" zh="平台参数建议"><TextArea value={`${active.platformPromptZh}${NL}${active.platformPromptEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ platformPromptZh: zh, platformPromptEn: en.join(NL) }); }} /></FormField><FormField label="Sound" zh="声音设计"><TextArea value={`${active.soundDesignZh}${NL}${active.soundDesignEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ soundDesignZh: zh, soundDesignEn: en.join(NL) }); }} /></FormField><FormField label="Continuity" zh="连续性检查"><TextArea value={`${active.continuityCheckZh}${NL}${active.continuityCheckEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ continuityCheckZh: zh, continuityCheckEn: en.join(NL) }); }} /></FormField></div><div className="bg-cyan-500/5 border border-cyan-500/10 rounded-3xl p-6 space-y-4"><div className="flex items-center justify-between"><div><div className="text-[12px] font-black uppercase tracking-[0.25em] text-cyan-200">AI Video Prompt / 视频生成提示词</div><div className="text-[11px] text-stone-500 mt-1">中英文双语，可直接复制；会随当前编辑实时更新</div></div><CopyButton text={livePrompt} /></div><pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-cyan-100/70 font-mono max-h-[420px] overflow-y-auto bg-black/40 p-5 rounded-2xl">{livePrompt}</pre></div></div></GlassPanel></div>}
-    </section>
+        {shots.length > 0 && <StoryboardTimeline shots={shots} activeShot={activeShot} onSelect={setActiveShot} />}
 
-    <main className="xl:col-span-3 space-y-8">
-      <GlassPanel title="12 Pro Modules" subTitle="十二大专业模块"><div className="grid grid-cols-2 gap-3">{moduleKeys.map((k, i) => <button key={k} onClick={() => setActiveModule(k)} className={`rounded-2xl border p-4 text-left ${activeModule === k ? "bg-amber-400 border-amber-400 text-black" : "bg-white/5 border-white/5 hover:bg-white/10 text-stone-400"}`}><div className="text-[10px] font-black opacity-60">MODULE {String(i + 1).padStart(2, "0")}</div><div className="text-[12px] font-black mt-1">{modules[k].title}</div><div className="text-[11px] opacity-70 mt-1">{modules[k].zh}</div></button>)}</div></GlassPanel>
-      <GlassPanel title={modules[activeModule].title} subTitle={modules[activeModule].zh}><div className="space-y-5">{activeModule === "commercial" && <FormField label="Production Mode" zh="制作模式"><Select items={OPT.productionModes} value={modules.commercial.fields.mode} onChange={v => updateModuleField("commercial", "mode", v)} /></FormField>}{activeModule === "versions" && <FormField label="Version Preset" zh="版本预设"><Select items={OPT.versionModes} value={modules.versions.fields.selected.split(",")[0] || OPT.versionModes[0]} onChange={v => updateModuleField("versions", "selected", v)} /></FormField>}{Object.entries(modules[activeModule].fields).filter(([key]) => !(activeModule === "commercial" && key === "mode")).map(([key, value]) => <FormField key={key} label={key} zh="模块参数"><TextArea value={value} onChange={e => updateModuleField(activeModule, key, e.target.value)} rows={3} /></FormField>)}</div></GlassPanel>
-      <GlassPanel title="Pro Switches" subTitle="专业开关"><div className="space-y-3"><Toggle checked={tech.bilingualDialogue} onChange={v => setTech(p => ({ ...p, bilingualDialogue: v }))} label="Bilingual Dialogue" zh="中英文双语台词" /><Toggle checked={tech.professionalAV} onChange={v => setTech(p => ({ ...p, professionalAV: v }))} label="Professional AV Logic" zh="专业视听语言逻辑" /><Toggle checked={tech.includeSound} onChange={v => setTech(p => ({ ...p, includeSound: v }))} label="Sound & Transition" zh="声音与剪辑转场" /></div></GlassPanel>
-      <GlassPanel title="Health" subTitle="系统状态"><div className="text-center py-6"><div className="text-5xl font-black text-amber-400">{qualityScore}%</div><div className="text-[10px] font-bold text-stone-500 uppercase tracking-widest mt-2">Quality Stability / 质量稳定度</div><p className="text-[11px] text-stone-600 mt-5 leading-relaxed">12 个模块都会进入 API 提示词，不会阉割原本的生成、编辑、复制、导出、动态参数锁定功能。</p></div></GlassPanel>
+        {shots.length > 0 && active && <div className="space-y-6"><div className="flex gap-2 overflow-x-auto pb-4">{shots.map((_, i) => <button key={i} onClick={() => setActiveShot(i)} className={`min-w-fit px-5 py-3 rounded-2xl text-[11px] font-black uppercase ${activeShot === i ? "bg-amber-400 text-black" : "bg-white/5 text-stone-500 hover:bg-white/10"}`}>Shot {i + 1} / 镜头 {i + 1}</button>)}</div><GlassPanel title={`Shot Matrix #${active.id}`} subTitle={`${active.titleZh} / ${active.titleEn}`}><div className="space-y-7"><div className="grid grid-cols-1 md:grid-cols-2 gap-6"><FormField label="Visual ZH" zh="中文画面"><TextArea value={active.sceneZh} rows={6} onChange={e => updateActiveShot({ sceneZh: e.target.value })} /></FormField><FormField label="Visual EN" zh="英文画面"><TextArea value={active.sceneEn} rows={6} onChange={e => updateActiveShot({ sceneEn: e.target.value })} /></FormField><FormField label="Dialogue ZH" zh="中文台词"><TextArea value={active.dialogueZh} rows={3} onChange={e => updateActiveShot({ dialogueZh: e.target.value })} /></FormField><FormField label="Dialogue EN" zh="英文台词"><TextArea value={active.dialogueEn} rows={3} onChange={e => updateActiveShot({ dialogueEn: e.target.value })} /></FormField><FormField label="AV Logic ZH" zh="中文视听逻辑"><TextArea value={active.avLogicZh} rows={5} onChange={e => updateActiveShot({ avLogicZh: e.target.value })} /></FormField><FormField label="AV Logic EN" zh="英文视听逻辑"><TextArea value={active.avLogicEn} rows={5} onChange={e => updateActiveShot({ avLogicEn: e.target.value })} /></FormField><FormField label="Blocking ZH" zh="中文调度"><TextArea value={active.blockingZh} rows={4} onChange={e => updateActiveShot({ blockingZh: e.target.value })} /></FormField><FormField label="Blocking EN" zh="英文调度"><TextArea value={active.blockingEn} rows={4} onChange={e => updateActiveShot({ blockingEn: e.target.value })} /></FormField></div><div className="grid grid-cols-1 md:grid-cols-4 gap-5"><FormField label="Shot Size" zh="景别"><Select items={OPT.shotSizes} value={active.shotSize} onChange={v => updateActiveShot({ shotSize: v })} /></FormField><FormField label="Camera" zh="摄影机"><Select items={OPT.cameras} value={active.camera} onChange={v => updateActiveShot({ camera: v })} /></FormField><FormField label="Lens" zh="焦段"><Select items={OPT.lensFocals} value={active.lens} onChange={v => updateActiveShot({ lens: v })} /></FormField><FormField label="Movement" zh="运镜"><Select items={OPT.moves} value={active.move} onChange={v => updateActiveShot({ move: v })} /></FormField><FormField label="Stabilizer" zh="稳定"><Select items={OPT.stabilizers} value={active.stabilizer} onChange={v => updateActiveShot({ stabilizer: v })} /></FormField><FormField label="Lighting" zh="光影"><Select items={OPT.lights} value={active.light} onChange={v => updateActiveShot({ light: v })} /></FormField><FormField label="Composition" zh="构图"><Select items={OPT.compositions} value={active.compositionType} onChange={v => updateActiveShot({ compositionType: v })} /></FormField><FormField label="Edit" zh="剪辑"><Select items={OPT.edits} value={active.editType} onChange={v => updateActiveShot({ editType: v })} /></FormField></div><div className="grid grid-cols-1 md:grid-cols-2 gap-6"><FormField label="Omni Multi-Parameter" zh="全能多参"><TextArea value={`${active.omniParamPromptZh}${NL}${active.omniParamPromptEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ omniParamPromptZh: zh, omniParamPromptEn: en.join(NL) }); }} /></FormField><FormField label="Platform Params" zh="平台参数建议"><TextArea value={`${active.platformPromptZh}${NL}${active.platformPromptEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ platformPromptZh: zh, platformPromptEn: en.join(NL) }); }} /></FormField><FormField label="Sound" zh="声音设计"><TextArea value={`${active.soundDesignZh}${NL}${active.soundDesignEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ soundDesignZh: zh, soundDesignEn: en.join(NL) }); }} /></FormField><FormField label="Continuity" zh="连续性检查"><TextArea value={`${active.continuityCheckZh}${NL}${active.continuityCheckEn}`} rows={4} onChange={e => { const [zh = "", ...en] = e.target.value.split(NL); updateActiveShot({ continuityCheckZh: zh, continuityCheckEn: en.join(NL) }); }} /></FormField></div><ShotQualityPanel shot={active} /><div className="bg-cyan-500/5 border border-cyan-500/10 rounded-3xl p-6 space-y-4"><div className="flex items-center justify-between"><div><div className="text-[12px] font-black uppercase tracking-[0.25em] text-cyan-200">AI Video Prompt / 视频生成提示词</div><div className="text-[11px] text-stone-500 mt-1">中英文双语，可直接复制；会随当前编辑实时更新</div></div><CopyButton text={livePrompt} /></div><pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-cyan-100/70 font-mono max-h-[420px] overflow-y-auto bg-black/40 p-5 rounded-2xl">{livePrompt}</pre></div></div></GlassPanel></div>}
+      </section>
+
+      <main className="xl:col-span-3 space-y-8">
+        <GlassPanel title="12 Pro Modules" subTitle="十二大专业模块"><div className="grid grid-cols-2 gap-3">{moduleKeys.map((k, i) => <button key={k} onClick={() => setActiveModule(k)} className={`rounded-2xl border p-4 text-left ${activeModule === k ? "bg-amber-400 border-amber-400 text-black" : "bg-white/5 border-white/5 hover:bg-white/10 text-stone-400"}`}><div className="text-[10px] font-black opacity-60">MODULE {String(i + 1).padStart(2, "0")}</div><div className="text-[12px] font-black mt-1">{modules[k].title}</div><div className="text-[11px] opacity-70 mt-1">{modules[k].zh}</div></button>)}</div></GlassPanel>
+        <GlassPanel title={modules[activeModule].title} subTitle={modules[activeModule].zh}><div className="space-y-5">{activeModule === "commercial" && <FormField label="Production Mode" zh="制作模式"><Select items={OPT.productionModes} value={modules.commercial.fields.mode} onChange={v => updateModuleField("commercial", "mode", v)} /></FormField>}{activeModule === "versions" && <FormField label="Version Preset" zh="版本预设"><Select items={OPT.versionModes} value={modules.versions.fields.selected.split(",")[0] || OPT.versionModes[0]} onChange={v => updateModuleField("versions", "selected", v)} /></FormField>}{Object.entries(modules[activeModule].fields).filter(([key]) => !(activeModule === "commercial" && key === "mode")).map(([key, value]) => <FormField key={key} label={key} zh="模块参数"><TextArea value={value} onChange={e => updateModuleField(activeModule, key, e.target.value)} rows={3} /></FormField>)}</div></GlassPanel>
+        <GlassPanel title="Pro Switches" subTitle="专业开关"><div className="space-y-3"><Toggle checked={tech.bilingualDialogue} onChange={v => setTech(p => ({ ...p, bilingualDialogue: v }))} label="Bilingual Dialogue" zh="中英文双语台词" /><Toggle checked={tech.professionalAV} onChange={v => setTech(p => ({ ...p, professionalAV: v }))} label="Professional AV Logic" zh="专业视听语言逻辑" /><Toggle checked={tech.includeSound} onChange={v => setTech(p => ({ ...p, includeSound: v }))} label="Sound & Transition" zh="声音与剪辑转场" /></div></GlassPanel>
+        <HistoryPanel history={generationHistory} onRestore={restoreHistory} />
+        <GlassPanel title="Health" subTitle="系统状态"><div className="text-center py-6"><div className="text-5xl font-black text-amber-400">{qualityScore}%</div><div className="text-[10px] font-bold text-stone-500 uppercase tracking-widest mt-2">Quality Stability / 质量稳定度</div><p className="text-[11px] text-stone-600 mt-5 leading-relaxed">12 个模块都会进入 API 提示词，不会阉割原本的生成、编辑、复制、导出、动态参数锁定功能。</p></div></GlassPanel>
+      </main>
     </main>
-  </main>
-</div>;
+  </div>;
 }
