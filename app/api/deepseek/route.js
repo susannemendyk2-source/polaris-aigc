@@ -1,18 +1,14 @@
-// Optional Next.js App Router proxy route for Polaris AIGC Film Industrial System V4.3
-// Put this file at: app/api/deepseek/route.js
-// Add your key to .env.local: DEEPSEEK_API_KEY=sk-xxxx
+// Place this file at: app/api/deepseek/route.js
+// Add DEEPSEEK_API_KEY=sk-xxxx to .env.local
 
-export const runtime = "nodejs";
-
-export async function POST(request) {
+export async function POST(req) {
   try {
     const apiKey = process.env.DEEPSEEK_API_KEY;
     if (!apiKey) {
-      return Response.json({ error: "Missing DEEPSEEK_API_KEY in .env.local" }, { status: 500 });
+      return Response.json({ error: "Missing DEEPSEEK_API_KEY in server environment" }, { status: 500 });
     }
-
-    const body = await request.json();
-    const upstream = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    const body = await req.json();
+    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -20,13 +16,12 @@ export async function POST(request) {
       },
       body: JSON.stringify(body),
     });
-
-    const text = await upstream.text();
+    const text = await res.text();
     return new Response(text, {
-      status: upstream.status,
-      headers: { "Content-Type": upstream.headers.get("Content-Type") || "application/json" },
+      status: res.status,
+      headers: { "Content-Type": res.headers.get("content-type") || "application/json" },
     });
   } catch (error) {
-    return Response.json({ error: error.message || "Proxy request failed" }, { status: 500 });
+    return Response.json({ error: String(error?.message || error) }, { status: 500 });
   }
 }
