@@ -1,0 +1,26 @@
+{
+  "name": "polaris-aigc",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@tailwindcss/postcss": "^4.3.0",
+    "critters": "^0.0.23",
+    "next": "^16.2.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^16.2.0",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^4.0.0"
+  }
+}
